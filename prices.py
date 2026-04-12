@@ -8,18 +8,22 @@ def get_price(ticker: str) -> float | None:
     """
     Yahoo Finance üzerinden BIST hisse fiyatını çek.
     BIST hisseleri için '.IS' uzantısı eklenir (ör: GARAN → GARAN.IS).
-    Başarısız olursa None döner.
+    Hafta sonu / tatil günlerinde son kapanış fiyatı döner.
     """
     symbol = f"{ticker.upper()}.IS"
     try:
         stock = yf.Ticker(symbol)
-        # fast_info daha hızlı ve önbelleksiz
-        price = stock.fast_info.get("last_price")
-        if price and price > 0:
-            return round(price, 4)
 
-        # Fallback: günlük geçmiş
-        hist = stock.history(period="1d", auto_adjust=True)
+        # Önce fast_info dene (attribute olarak, dict değil)
+        try:
+            price = stock.fast_info.last_price
+            if price and price > 0:
+                return round(float(price), 4)
+        except Exception:
+            pass
+
+        # Fallback: son 5 günlük geçmiş (hafta sonu / tatil günleri için)
+        hist = stock.history(period="5d", auto_adjust=True)
         if not hist.empty:
             return round(float(hist["Close"].iloc[-1]), 4)
 
@@ -45,27 +49,35 @@ def get_prices_bulk(tickers: list[str]) -> dict[str, float | None]:
     try:
         data = yf.download(
             symbols,
-            period="1d",
+            period="5d",          # hafta sonu için 5 güne genişlettik
             auto_adjust=True,
             progress=False,
             threads=True,
         )
 
         if data.empty:
-            return {t: None for t in tickers}
+            # Toplu çekme başarısız olduysa teker teker dene
+            for ticker in tickers:
+                results[ticker] = get_price(ticker)
+            return results
 
-        close = data["Close"] if len(tickers) > 1 else data[["Close"]]
+        close = data["Close"]
 
         for ticker, symbol in zip(tickers, symbols):
             try:
-                col = symbol if len(tickers) > 1 else "Close"
-                price = float(close[col].dropna().iloc[-1])
+                if len(tickers) == 1:
+                    series = close
+                else:
+                    series = close[symbol]
+                price = float(series.dropna().iloc[-1])
                 results[ticker] = round(price, 4) if price > 0 else None
             except Exception:
-                results[ticker] = None
+                # Toplu çekmede hata varsa teker teker dene
+                results[ticker] = get_price(ticker)
 
     except Exception as e:
         logger.error(f"Toplu fiyat hatası: {e}")
-        return {t: None for t in tickers}
+        for ticker in tickers:
+            results[ticker] = get_price(ticker)
 
     return results
