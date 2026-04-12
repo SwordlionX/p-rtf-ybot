@@ -81,7 +81,9 @@ def main_menu_keyboard():
     ])
 
 
-async def send_main_menu(update: Update, text: str = None) -> None:
+async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE = None, text: str = None) -> None:
+    if update.callback_query:
+        await update.callback_query.answer()
     msg = text or "👋 *BIST Portföy Botu*\n\nAşağıdaki menüden işlem seçin:"
     kb = main_menu_keyboard()
     if update.callback_query:
@@ -573,6 +575,36 @@ async def cb_temizle_evet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ─────────────────────────────────────────────
+#  Tek seferlik toplu yükleme — /yukle
+# ─────────────────────────────────────────────
+SEED_DATA = [
+    ("AAGYO",  145,    21.10),
+    ("AKBNK",  38,     77.21),
+    ("ALVES",  1415,   3.32),
+    ("CIMSA",  44,     48.79),
+    ("EKGYO",  324,    21.39),
+    ("GARAN",  30,     133.31),
+    ("GRSEL",  16,     310.28),
+    ("SELEC",  144,    80.53),
+    ("YKBNK",  77,     38.50),
+    ("NSP",    50324,  1.442022),
+]
+
+async def cmd_yukle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await deny(update)
+        return
+    user_id = update.effective_user.id
+    msg = await update.message.reply_text("⏳ Portföy yükleniyor...")
+    lines = []
+    for ticker, qty, cost in SEED_DATA:
+        add_holding(user_id, ticker, qty, cost)
+        lines.append(f"✅ {ticker}: {qty:,.0f} adet @ {cost} ₺")
+    lines.append(f"\n🎉 *{len(SEED_DATA)} pozisyon yüklendi!*")
+    await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────
 #  Başlangıç Sermayesi
 # ─────────────────────────────────────────────
 async def cb_sermaye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -848,6 +880,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu",  start))
+    app.add_handler(CommandHandler("yukle", cmd_yukle))
     app.add_handler(ekle_conv)
     app.add_handler(sat_conv)
     app.add_handler(nakit_conv)
