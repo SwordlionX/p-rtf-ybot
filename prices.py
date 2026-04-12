@@ -1,83 +1,76 @@
 import logging
-import yfinance as yf
+import requests
 
 logger = logging.getLogger(__name__)
+
+# Yahoo Finance'e gerçek tarayıcı gibi görünmek için header
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+def _fetch_yahoo(symbol: str) -> float | None:
+    """Yahoo Finance API'sine direkt istek at (yfinance kütüphanesi bypass)."""
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?interval=1d&range=5d"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        closes = (
+            data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        )
+        closes = [c for c in closes if c is not None]
+        if closes:
+            return round(closes[-1], 4)
+    except Exception as e:
+        logger.debug(f"Yahoo v8 başarısız ({symbol}): {e}")
+
+    # 2. deneme — farklı endpoint
+    url2 = (
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?interval=1d&range=5d"
+    )
+    try:
+        r = requests.get(url2, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        closes = (
+            data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        )
+        closes = [c for c in closes if c is not None]
+        if closes:
+            return round(closes[-1], 4)
+    except Exception as e:
+        logger.debug(f"Yahoo v8 (query2) başarısız ({symbol}): {e}")
+
+    return None
 
 
 def get_price(ticker: str) -> float | None:
     """
-    Yahoo Finance üzerinden BIST hisse fiyatını çek.
-    BIST hisseleri için '.IS' uzantısı eklenir (ör: GARAN → GARAN.IS).
-    Hafta sonu / tatil günlerinde son kapanış fiyatı döner.
+    BIST hisse fiyatını çek. Hafta sonu / tatil günleri son kapanış döner.
     """
     symbol = f"{ticker.upper()}.IS"
-    try:
-        stock = yf.Ticker(symbol)
-
-        # Önce fast_info dene (attribute olarak, dict değil)
-        try:
-            price = stock.fast_info.last_price
-            if price and price > 0:
-                return round(float(price), 4)
-        except Exception:
-            pass
-
-        # Fallback: son 5 günlük geçmiş (hafta sonu / tatil günleri için)
-        hist = stock.history(period="5d", auto_adjust=True)
-        if not hist.empty:
-            return round(float(hist["Close"].iloc[-1]), 4)
-
+    price = _fetch_yahoo(symbol)
+    if price is None:
         logger.warning(f"Fiyat alınamadı: {symbol}")
-        return None
-
-    except Exception as e:
-        logger.error(f"Fiyat hatası ({symbol}): {e}")
-        return None
+    return price
 
 
 def get_prices_bulk(tickers: list[str]) -> dict[str, float | None]:
     """
-    Birden fazla hisse için toplu fiyat çekme (daha verimli).
+    Birden fazla hisse için fiyat çek.
     Döndürür: {ticker: price}
     """
-    if not tickers:
-        return {}
-
-    symbols = [f"{t.upper()}.IS" for t in tickers]
     results = {}
-
-    try:
-        data = yf.download(
-            symbols,
-            period="5d",          # hafta sonu için 5 güne genişlettik
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-
-        if data.empty:
-            # Toplu çekme başarısız olduysa teker teker dene
-            for ticker in tickers:
-                results[ticker] = get_price(ticker)
-            return results
-
-        close = data["Close"]
-
-        for ticker, symbol in zip(tickers, symbols):
-            try:
-                if len(tickers) == 1:
-                    series = close
-                else:
-                    series = close[symbol]
-                price = float(series.dropna().iloc[-1])
-                results[ticker] = round(price, 4) if price > 0 else None
-            except Exception:
-                # Toplu çekmede hata varsa teker teker dene
-                results[ticker] = get_price(ticker)
-
-    except Exception as e:
-        logger.error(f"Toplu fiyat hatası: {e}")
-        for ticker in tickers:
-            results[ticker] = get_price(ticker)
-
+    for ticker in tickers:
+        results[ticker] = get_price(ticker)
     return results
