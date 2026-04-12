@@ -18,24 +18,12 @@ BROWSER_HEADERS = {
 
 
 # ─────────────────────────────────────────────
-#  TEFAS fon fiyatı (session ile cookie alarak)
+#  TEFAS fon fiyatı
 # ─────────────────────────────────────────────
 def _fetch_tefas(fund_code: str) -> float | None:
-    code     = fund_code.upper()
-    today    = datetime.now().strftime("%d.%m.%Y")
+    code = fund_code.upper()
+    today = datetime.now().strftime("%d.%m.%Y")
     week_ago = (datetime.now() - timedelta(days=10)).strftime("%d.%m.%Y")
-
-    session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
-
-    # Önce ana sayfayı ziyaret et → cookie al
-    try:
-        session.get(
-            f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={code}",
-            timeout=10,
-        )
-    except Exception as e:
-        logger.debug(f"TEFAS ana sayfa hatası: {e}")
 
     payload = {
         "fontip":    "YAT",
@@ -50,45 +38,63 @@ def _fetch_tefas(fund_code: str) -> float | None:
         "Referer":          f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={code}",
         "Origin":           "https://www.tefas.gov.tr",
         "Accept":           "application/json, text/javascript, */*; q=0.01",
+        "User-Agent":       BROWSER_HEADERS["User-Agent"],
+        "Accept-Language":  "tr-TR,tr;q=0.9",
     }
+    url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
 
-    for method in ("post", "get"):
-        try:
-            if method == "post":
-                r = session.post(
-                    "https://www.tefas.gov.tr/api/DB/BindHistoryInfo",
-                    data=payload, headers=api_headers, timeout=15,
-                )
-            else:
-                r = session.get(
-                    "https://www.tefas.gov.tr/api/DB/BindHistoryInfo",
-                    params=payload, headers=api_headers, timeout=15,
-                )
-            r.raise_for_status()
-            data = r.json()
-            price = _parse_tefas(data)
-            if price:
-                logger.info(f"TEFAS {code}: {price} ({method.upper()})")
-                return price
-        except Exception as e:
-            logger.debug(f"TEFAS {method.upper()} hatası ({code}): {e}")
+    # Yöntem 1: Cookie olmadan direkt POST (tefas-python gibi)
+    try:
+        r = requests.post(url, data=payload, headers=api_headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        price = _parse_tefas(data, code)
+        if price:
+            logger.info(f"TEFAS direct {code}: {price}")
+            return price
+    except Exception as e:
+        logger.debug(f"TEFAS direct POST hatası ({code}): {e}")
 
-    logger.warning(f"TEFAS tüm denemeler başarısız: {code}")
+    # Yöntem 2: Session ile cookie alarak
+    try:
+        session = requests.Session()
+        session.headers.update(BROWSER_HEADERS)
+        session.get(
+            f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={code}",
+            timeout=10,
+        )
+        r = session.post(url, data=payload, headers=api_headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        price = _parse_tefas(data, code)
+        if price:
+            logger.info(f"TEFAS session {code}: {price}")
+            return price
+    except Exception as e:
+        logger.debug(f"TEFAS session hatası ({code}): {e}")
+
+    logger.warning(f"TEFAS başarısız: {code}")
     return None
 
 
-def _parse_tefas(data: dict) -> float | None:
-    rows = data.get("data", [])
+def _parse_tefas(data: dict, code: str = "") -> float | None:
+    rows = data.get("data", data.get("result", []))
     if not rows:
+        logger.debug(f"TEFAS boş data ({code}). Keys: {list(data.keys())}")
         return None
     last = rows[-1]
-    for key in ("BirimPayDegeri", "FIYAT", "fiyat", "price"):
+    logger.debug(f"TEFAS son satır anahtarları ({code}): {list(last.keys())}")
+    for key in ("BirimPayDegeri", "BIRIM_PAY_DEGERI", "birimpaydegeri",
+                "FIYAT", "fiyat", "price", "Price", "BPD"):
         raw = last.get(key)
         if raw is not None:
             try:
                 val = float(str(raw).replace(",", "."))
-                if 0 < val < 1000:   # fon birim payı makul aralık
+                if 0 < val < 500:  # fon birim payı makul aralık
+                    logger.info(f"TEFAS {code} → '{key}': {val}")
                     return round(val, 6)
+                else:
+                    logger.debug(f"TEFAS {code} '{key}' = {val} → aralık dışı, atlandı")
             except Exception:
                 continue
     return None
@@ -125,17 +131,18 @@ def is_fund(ticker: str) -> bool:
 def get_price(ticker: str) -> float | None:
     t = ticker.upper()
     if t in TEFAS_FUNDS:
+        # TEFAS fonları için SADECE TEFAS kullan — Yahoo'ya düşme!
         price = _fetch_tefas(t)
         if price is None:
             logger.warning(f"TEFAS fiyat alınamadı: {t}")
         return price
 
-    # Hisse senedi → Yahoo Finance
+    # Hisse senedi → Yahoo Finance (.IS uzantısıyla)
     price = _fetch_yahoo(f"{t}.IS")
     if price is not None:
         return price
 
-    # Yahoo'da yoksa TEFAS'ta bak (kullanıcı fon eklemiş olabilir)
+    # Yahoo'da yoksa TEFAS'a bak
     return _fetch_tefas(t)
 
 
