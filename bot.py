@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import date as date_type, datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -15,9 +16,14 @@ from database import (
     add_holding,
     get_holdings,
     remove_holding,
+    sell_holding,
     clear_portfolio,
     set_cash,
     get_cash,
+    get_realized_pnl,
+    get_trade_history,
+    set_starting_capital,
+    get_starting_info,
 )
 from prices import get_price, get_prices_bulk
 
@@ -28,26 +34,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_TICKER, ASK_QUANTITY, ASK_PRICE, ASK_CASH = range(4)
+ASK_TICKER, ASK_QUANTITY, ASK_PRICE, ASK_CASH, ASK_CAPITAL, ASK_CAPITAL_DATE = range(6)
+SAT_TICKER, SAT_QUANTITY, SAT_PRICE = range(6, 9)
 
 # ─────────────────────────────────────────────
 #  Sahip kontrolü
 # ─────────────────────────────────────────────
-# Railway'de OWNER_ID değişkenini kendi Telegram ID'nle ayarla.
-# ID'ni öğrenmek için @userinfobot'a yaz.
-# OWNER_ID=0 ise kısıtlama yok (herkes ekleyip çıkarabilir).
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
-
-# Portföyü görüntülerken hangi kullanıcının verisini göster
-# Gruptaki !portföy, her zaman SAHİBİN portföyünü gösterir
-def owner_id() -> int:
-    return OWNER_ID if OWNER_ID else 0
 
 def is_owner(user_id: int) -> bool:
     return OWNER_ID == 0 or user_id == OWNER_ID
 
 async def deny(update: Update) -> None:
-    """Yetkisiz işlem uyarısı."""
     if update.callback_query:
         await update.callback_query.answer(
             "⛔ Bu işlemi sadece portföy sahibi yapabilir.", show_alert=True
@@ -66,12 +64,19 @@ def main_menu_keyboard():
             InlineKeyboardButton("➕ Hisse Ekle",     callback_data="ekle"),
         ],
         [
-            InlineKeyboardButton("💵 Nakit Güncelle", callback_data="nakit"),
-            InlineKeyboardButton("🗑 Hisse Sil",      callback_data="sil_menu"),
+            InlineKeyboardButton("📤 Hisse Sat",      callback_data="sat_menu"),
+            InlineKeyboardButton("🗑 Pozisyon Sil",   callback_data="sil_menu"),
         ],
         [
-            InlineKeyboardButton("📋 Listele",            callback_data="liste"),
-            InlineKeyboardButton("🧹 Portföyü Temizle",   callback_data="temizle_onay"),
+            InlineKeyboardButton("💵 Nakit Güncelle",     callback_data="nakit"),
+            InlineKeyboardButton("🏦 Başlangıç Sermayesi", callback_data="sermaye"),
+        ],
+        [
+            InlineKeyboardButton("📜 Satış Geçmişi", callback_data="gecmis"),
+            InlineKeyboardButton("📋 Listele",        callback_data="liste"),
+        ],
+        [
+            InlineKeyboardButton("🧹 Portföyü Temizle", callback_data="temizle_onay"),
         ],
     ])
 
@@ -93,9 +98,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────
-#  Portföy hesaplama yardımcısı
+#  Portföy metni oluştur
 # ─────────────────────────────────────────────
-def build_portfolio_text(holdings, prices, cash: float) -> str:
+def _performance_block(grand_total: float, start_info: dict) -> str:
+    """Başlangıçtan bu yana getiri, aylık ve yıllık öngörü."""
+    capital = start_info.get("capital", 0)
+    start_date_str = start_info.get("date")
+    if not capital or not start_date_str:
+        return ""
+
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    except Exception:
+        return ""
+
+    today = date_type.today()
+    days = (today - start_dt).days
+    if days <= 0:
+        return ""
+
+    net_pnl = grand_total - capital
+    net_pct = (net_pnl / capital) * 100
+
+    # Bileşik getiri oranı (günlük)
+    daily_rate = (grand_total / capital) ** (1 / days) - 1
+    monthly_pct = ((1 + daily_rate) ** 30 - 1) * 100
+    annual_pct  = ((1 + daily_rate) ** 365 - 1) * 100
+
+    net_emoji = "🟢" if net_pnl >= 0 else "🔴"
+
+    # Süreyi oku
+    months = days // 30
+    rem_days = days % 30
+    if months > 0:
+        sure = f"{months} ay {rem_days} gün" if rem_days else f"{months} ay"
+    else:
+        sure = f"{days} gün"
+
+    return (
+        f"\n{'─' * 28}\n"
+        f"🏦 *Başlangıç:* {capital:,.2f} ₺  _{start_date_str}_\n"
+        f"⏱ *Süre:* {sure}\n"
+        f"{net_emoji} *Toplam Getiri:* {net_pnl:+,.2f} ₺ ({net_pct:+.2f}%)\n"
+        f"📅 *Aylık Getiri:* %{monthly_pct:+.2f}\n"
+        f"📆 *Yıllık Öngörü:* %{annual_pct:+.2f}"
+    )
+
+
+def build_portfolio_text(holdings, prices, cash: float, realized_pnl: float = 0.0, start_info: dict = None) -> str:
     lines = []
     total_cost = 0
     total_value = 0
@@ -112,17 +162,16 @@ def build_portfolio_text(holdings, prices, cash: float) -> str:
         emoji = "🟢" if pnl >= 0 else "🔴"
         total_cost += cost
         total_value += value
-        lines.append((value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct, cost))
+        lines.append((value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct))
 
-    grand_total = total_value + cash  # hisse + nakit
+    grand_total = total_value + cash
 
-    # Satırları formatla
     formatted = []
     for item in lines:
         if item[0] is None:
-            formatted.append(item[2])  # hata satırı
+            formatted.append(item[2])
             continue
-        value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct, cost = item
+        value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct = item
         alloc = (value / grand_total * 100) if grand_total > 0 else 0
         formatted.append(
             f"{emoji} *{ticker}* — %{alloc:.1f}\n"
@@ -130,7 +179,6 @@ def build_portfolio_text(holdings, prices, cash: float) -> str:
             f"  K/Z: {pnl:+,.2f}₺ ({pnl_pct:+.2f}%)"
         )
 
-    # Nakit satırı
     if cash > 0:
         cash_alloc = (cash / grand_total * 100) if grand_total > 0 else 0
         formatted.append(f"💵 *Nakit* — %{cash_alloc:.1f}\n  {cash:,.2f} ₺")
@@ -138,6 +186,7 @@ def build_portfolio_text(holdings, prices, cash: float) -> str:
     total_pnl = total_value - total_cost
     total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
     total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    real_emoji = "🟢" if realized_pnl >= 0 else "🔴"
 
     text = (
         "📊 *BIST Portföy Durumu*\n"
@@ -149,10 +198,14 @@ def build_portfolio_text(holdings, prices, cash: float) -> str:
     )
     if cash > 0:
         text += f"💵 *Nakit:* {cash:,.2f} ₺\n"
-    text += (
-        f"🏦 *Toplam Portföy:* {grand_total:,.2f} ₺\n"
-        f"{total_emoji} *Hisse K/Z:* {total_pnl:+,.2f} ₺ ({total_pnl_pct:+.2f}%)"
-    )
+    text += f"🏦 *Toplam Portföy:* {grand_total:,.2f} ₺\n"
+    text += f"{total_emoji} *Anlık K/Z:* {total_pnl:+,.2f} ₺ ({total_pnl_pct:+.2f}%)\n"
+    if realized_pnl != 0:
+        text += f"{real_emoji} *Gerçekleşen K/Z:* {realized_pnl:+,.2f} ₺"
+
+    if start_info:
+        text += _performance_block(grand_total, start_info)
+
     return text
 
 
@@ -176,11 +229,11 @@ async def cb_portfoy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     await query.edit_message_text("⏳ Fiyatlar alınıyor...")
-
     tickers = [row[0] for row in holdings]
     prices = get_prices_bulk(tickers) if tickers else {}
-
-    text = build_portfolio_text(holdings, prices, cash)
+    realized = get_realized_pnl(user_id)
+    start_info = get_starting_info(user_id)
+    text = build_portfolio_text(holdings, prices, cash, realized, start_info)
 
     await query.edit_message_text(
         text,
@@ -193,13 +246,187 @@ async def cb_portfoy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ─────────────────────────────────────────────
+#  Callback: Satış Geçmişi
+# ─────────────────────────────────────────────
+async def cb_gecmis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    trades = get_trade_history(user_id, limit=15)
+    realized = get_realized_pnl(user_id)
+
+    if not trades:
+        await query.edit_message_text(
+            "📜 Henüz satış işlemi yok.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Ana Menü", callback_data="menu")
+            ]])
+        )
+        return
+
+    lines = ["📜 *Son Satışlar:*\n"]
+    for ticker, qty, avg_cost, sell_price, pnl, sold_at in trades:
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        date = sold_at[:10] if sold_at else "?"
+        lines.append(
+            f"{emoji} *{ticker}* — {date}\n"
+            f"  {qty:,.0f} adet | {avg_cost:.2f}₺ → {sell_price:.2f}₺\n"
+            f"  K/Z: {pnl:+,.2f} ₺"
+        )
+
+    total_emoji = "🟢" if realized >= 0 else "🔴"
+    lines.append(f"\n{total_emoji} *Toplam Gerçekleşen K/Z: {realized:+,.2f} ₺*")
+
+    await query.edit_message_text(
+        "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Ana Menü", callback_data="menu")
+        ]])
+    )
+
+
+# ─────────────────────────────────────────────
+#  Hisse Satma — ConversationHandler
+# ─────────────────────────────────────────────
+async def cb_sat_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not is_owner(update.effective_user.id):
+        await deny(update)
+        return ConversationHandler.END
+    await query.answer()
+    user_id = update.effective_user.id
+    holdings = get_holdings(user_id)
+
+    if not holdings:
+        await query.edit_message_text(
+            "📂 Portföyünüzde hisse yok.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Ana Menü", callback_data="menu")
+            ]])
+        )
+        return ConversationHandler.END
+
+    buttons = [
+        [InlineKeyboardButton(f"📤 {ticker} ({qty:,.0f} adet)", callback_data=f"satx_{ticker}")]
+        for ticker, qty, _ in holdings
+    ]
+    buttons.append([InlineKeyboardButton("⬅️ İptal", callback_data="menu")])
+
+    await query.edit_message_text(
+        "📤 *Hangi hisseyi satmak istiyorsunuz?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return SAT_TICKER
+
+
+async def sat_ticker_secildi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    ticker = query.data.replace("satx_", "")
+    user_id = update.effective_user.id
+
+    holdings = {t: (q, c) for t, q, c in get_holdings(user_id)}
+    if ticker not in holdings:
+        await query.edit_message_text("❌ Hisse bulunamadı.")
+        return ConversationHandler.END
+
+    qty, avg_cost = holdings[ticker]
+    context.user_data["sat_ticker"] = ticker
+    context.user_data["sat_max_qty"] = qty
+    context.user_data["sat_avg_cost"] = avg_cost
+
+    await query.edit_message_text(
+        f"📤 *{ticker}* satışı\n\n"
+        f"Eldeki adet: *{qty:,.0f}*\n"
+        f"Ortalama maliyet: *{avg_cost:.2f} ₺*\n\n"
+        f"Kaç adet satmak istiyorsunuz?\n"
+        f"_(Tamamı için {qty:,.0f} yazın)_\n\n"
+        f"İptal için /iptal yazın.",
+        parse_mode="Markdown",
+    )
+    return SAT_QUANTITY
+
+
+async def sat_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        qty = float(text)
+        max_qty = context.user_data["sat_max_qty"]
+        if qty <= 0 or qty > max_qty:
+            raise ValueError
+    except (ValueError, KeyError):
+        await update.message.reply_text(
+            f"❌ Geçersiz adet. 0 ile {context.user_data.get('sat_max_qty', '?'):,.0f} arasında girin."
+        )
+        return SAT_QUANTITY
+
+    context.user_data["sat_quantity"] = qty
+    ticker = context.user_data["sat_ticker"]
+    await update.message.reply_text(
+        f"💰 *{ticker}* için satış fiyatı kaç TL?\n_(Örnek: 58.75)_",
+        parse_mode="Markdown",
+    )
+    return SAT_PRICE
+
+
+async def sat_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        sell_price = float(text)
+        if sell_price <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Geçersiz fiyat. Pozitif bir sayı girin.")
+        return SAT_PRICE
+
+    user_id = update.effective_user.id
+    ticker = context.user_data["sat_ticker"]
+    qty = context.user_data["sat_quantity"]
+    avg_cost = context.user_data["sat_avg_cost"]
+
+    result = sell_holding(user_id, ticker, qty, sell_price)
+    context.user_data.clear()
+
+    if result is None:
+        await update.message.reply_text("❌ Satış yapılamadı. Hisse bulunamadı.")
+        return ConversationHandler.END
+
+    pnl = result["realized_pnl"]
+    remaining = result["remaining"]
+    sold_qty = result["sold_qty"]
+    pnl_pct = (pnl / (avg_cost * sold_qty) * 100) if avg_cost > 0 else 0
+    emoji = "🟢" if pnl >= 0 else "🔴"
+
+    total_realized = get_realized_pnl(user_id)
+    total_emoji = "🟢" if total_realized >= 0 else "🔴"
+
+    kalan_txt = f"📦 Kalan: {remaining:,.0f} adet" if remaining > 0.001 else "📦 Pozisyon tamamen kapatıldı"
+
+    await update.message.reply_text(
+        f"✅ *{ticker}* satışı gerçekleşti!\n\n"
+        f"📤 Satılan: {sold_qty:,.0f} adet @ {sell_price:.2f} ₺\n"
+        f"💵 Maliyet: {avg_cost:.2f} ₺\n"
+        f"{kalan_txt}\n\n"
+        f"{emoji} *Bu satış K/Z:* {pnl:+,.2f} ₺ ({pnl_pct:+.2f}%)\n"
+        f"{total_emoji} *Toplam Gerçekleşen K/Z:* {total_realized:+,.2f} ₺",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
 #  Callback: Nakit Güncelle
 # ─────────────────────────────────────────────
 async def cb_nakit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not is_owner(update.effective_user.id):
+        await deny(update)
+        return ConversationHandler.END
     await query.answer()
-    user_id = update.effective_user.id
-    mevcut = get_cash(user_id)
+    mevcut = get_cash(update.effective_user.id)
     await query.edit_message_text(
         f"💵 *Nakit Güncelle*\n\n"
         f"Mevcut nakit: *{mevcut:,.2f} ₺*\n\n"
@@ -264,7 +491,7 @@ async def cb_liste(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────
-#  Callback: Sil Menüsü
+#  Callback: Sil Menüsü (K/Z kaydı olmadan siler)
 # ─────────────────────────────────────────────
 async def cb_sil_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -272,8 +499,7 @@ async def cb_sil_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await deny(update)
         return
     await query.answer()
-    user_id = update.effective_user.id
-    holdings = get_holdings(user_id)
+    holdings = get_holdings(update.effective_user.id)
 
     if not holdings:
         await query.edit_message_text(
@@ -285,13 +511,13 @@ async def cb_sil_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     buttons = [
-        [InlineKeyboardButton(f"🗑 {ticker} ({quantity:,.0f} adet)", callback_data=f"sil_{ticker}")]
-        for ticker, quantity, _ in holdings
+        [InlineKeyboardButton(f"🗑 {ticker} ({qty:,.0f} adet)", callback_data=f"sil_{ticker}")]
+        for ticker, qty, _ in holdings
     ]
     buttons.append([InlineKeyboardButton("⬅️ Ana Menü", callback_data="menu")])
 
     await query.edit_message_text(
-        "🗑 *Hangi hisseyi silmek istiyorsunuz?*",
+        "🗑 *Hangi pozisyonu silmek istiyorsunuz?*\n_(K/Z kaydı tutulmaz — satış için 📤 Sat kullanın)_",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -303,13 +529,11 @@ async def cb_sil_hisse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await deny(update)
         return
     await query.answer()
-    user_id = update.effective_user.id
     ticker = query.data.replace("sil_", "")
-    removed = remove_holding(user_id, ticker)
+    removed = remove_holding(update.effective_user.id, ticker)
     msg = f"✅ *{ticker}* portföyden silindi." if removed else f"❌ *{ticker}* bulunamadı."
     await query.edit_message_text(
-        msg,
-        parse_mode="Markdown",
+        msg, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Ana Menü", callback_data="menu")
         ]])
@@ -326,7 +550,7 @@ async def cb_temizle_onay(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     await query.answer()
     await query.edit_message_text(
-        "⚠️ *Tüm portföyü ve nakiti silmek istediğinizden emin misiniz?*\n"
+        "⚠️ *Tüm portföyü, nakiti ve satış geçmişini silmek istediğinizden emin misiniz?*\n"
         "Bu işlem geri alınamaz!",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
@@ -341,7 +565,7 @@ async def cb_temizle_evet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     clear_portfolio(update.effective_user.id)
     await query.edit_message_text(
-        "🧹 Portföyünüz ve nakitiniz temizlendi.",
+        "🧹 Portföy, nakit ve satış geçmişi temizlendi.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Ana Menü", callback_data="menu")
         ]])
@@ -349,7 +573,89 @@ async def cb_temizle_evet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ─────────────────────────────────────────────
-#  Hisse Ekleme — ConversationHandler
+#  Başlangıç Sermayesi
+# ─────────────────────────────────────────────
+async def cb_sermaye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not is_owner(update.effective_user.id):
+        await deny(update)
+        return ConversationHandler.END
+    await query.answer()
+    info = get_starting_info(update.effective_user.id)
+    if info["capital"] > 0:
+        mevcut_txt = f"*{info['capital']:,.2f} ₺*  _{info['date']}_"
+    else:
+        mevcut_txt = "_henüz ayarlanmamış_"
+    await query.edit_message_text(
+        f"🏦 *Başlangıç Sermayesi*\n\n"
+        f"Mevcut: {mevcut_txt}\n\n"
+        f"Portföyü başlattığınızda sahip olduğunuz *toplam tutarı* girin.\n"
+        f"_(Örnek: 100000)_\n\n"
+        f"İptal için /iptal yazın.",
+        parse_mode="Markdown",
+    )
+    return ASK_CAPITAL
+
+
+async def save_capital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        amount = float(update.message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Geçersiz tutar. Pozitif bir sayı girin.")
+        return ASK_CAPITAL
+
+    context.user_data["start_capital"] = amount
+    await update.message.reply_text(
+        f"📅 Portföyü başlattığınız *tarihi* girin:\n"
+        f"_(Örnek: 01.01.2025 veya 2025-01-01)_\n\n"
+        f"İptal için /iptal yazın.",
+        parse_mode="Markdown",
+    )
+    return ASK_CAPITAL_DATE
+
+
+async def save_capital_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+    # Hem GG.AA.YYYY hem YYYY-MM-DD formatını kabul et
+    parsed = None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            parsed = datetime.strptime(raw, fmt).date()
+            break
+        except ValueError:
+            continue
+
+    if parsed is None or parsed > date_type.today():
+        await update.message.reply_text(
+            "❌ Geçersiz tarih. Geçmiş bir tarih girin.\n_(Örnek: 01.01.2025)_",
+            parse_mode="Markdown",
+        )
+        return ASK_CAPITAL_DATE
+
+    amount = context.user_data.pop("start_capital")
+    date_str = parsed.strftime("%Y-%m-%d")
+    set_starting_capital(update.effective_user.id, amount, date_str)
+
+    days = (date_type.today() - parsed).days
+    months = days // 30
+    sure = f"{months} ay {days % 30} gün" if months else f"{days} gün"
+
+    await update.message.reply_text(
+        f"✅ Kaydedildi!\n\n"
+        f"🏦 Başlangıç: *{amount:,.2f} ₺*\n"
+        f"📅 Tarih: *{parsed.strftime('%d.%m.%Y')}*\n"
+        f"⏱ Geçen süre: *{sure}*\n\n"
+        f"Artık portföy ekranında toplam getiri, aylık ve yıllık öngörü görünecek.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+#  Hisse Ekleme
 # ─────────────────────────────────────────────
 async def cb_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -358,10 +664,8 @@ async def cb_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await query.answer()
     await query.edit_message_text(
-        "➕ *Hisse Ekleme*\n\n"
-        "Hangi hisseyi eklemek istiyorsunuz?\n"
-        "_(Örnek: GARAN, THYAO, EREGL)_\n\n"
-        "İptal için /iptal yazın.",
+        "➕ *Hisse Ekleme*\n\nHangi hisseyi eklemek istiyorsunuz?\n"
+        "_(Örnek: GARAN, THYAO, NSP)_\n\nİptal için /iptal yazın.",
         parse_mode="Markdown",
     )
     return ASK_TICKER
@@ -372,10 +676,8 @@ async def ekle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await deny(update)
         return ConversationHandler.END
     await update.message.reply_text(
-        "➕ *Hisse Ekleme*\n\n"
-        "Hangi hisseyi eklemek istiyorsunuz?\n"
-        "_(Örnek: GARAN, THYAO, EREGL)_\n\n"
-        "İptal için /iptal yazın.",
+        "➕ *Hisse Ekleme*\n\nHangi hisseyi eklemek istiyorsunuz?\n"
+        "_(Örnek: GARAN, THYAO, NSP)_\n\nİptal için /iptal yazın.",
         parse_mode="Markdown",
     )
     return ASK_TICKER
@@ -389,7 +691,6 @@ async def ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     msg = await update.message.reply_text(f"🔍 *{ticker}* kontrol ediliyor...", parse_mode="Markdown")
     price = get_price(ticker)
-
     if price is None:
         await msg.edit_text(
             f"❌ *{ticker}* bulunamadı. Hisse kodunu kontrol edip tekrar deneyin.",
@@ -438,7 +739,6 @@ async def save_holding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     ticker = context.user_data["ticker"]
     quantity = context.user_data["quantity"]
     current_price = context.user_data["current_price"]
-
     add_holding(user_id, ticker, quantity, avg_cost)
 
     cost = quantity * avg_cost
@@ -472,21 +772,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def message_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     if "!portföy" in text.lower() or "!portfoy" in text.lower():
-        # Grupta her zaman SAHİBİN portföyünü göster
-        # OWNER_ID ayarlanmamışsa mesajı yazan kişinin portföyünü göster
         view_id = OWNER_ID if OWNER_ID else update.effective_user.id
         holdings = get_holdings(view_id)
         cash = get_cash(view_id)
 
         if not holdings and cash == 0:
-            await update.message.reply_text("📂 Portföyünüz boş.")
+            await update.message.reply_text("📂 Portföy boş.")
             return
 
         msg = await update.message.reply_text("⏳ Fiyatlar alınıyor...")
         tickers = [row[0] for row in holdings]
         prices = get_prices_bulk(tickers) if tickers else {}
-
-        text_out = build_portfolio_text(holdings, prices, cash)
+        realized = get_realized_pnl(view_id)
+        start_info = get_starting_info(view_id)
+        text_out = build_portfolio_text(holdings, prices, cash, realized, start_info)
         await msg.edit_text(text_out, parse_mode="Markdown")
 
 
@@ -501,28 +800,62 @@ def main() -> None:
     init_db()
     app = Application.builder().token(token).build()
 
-    # Hisse ekleme + nakit güncelleme ConversationHandler
-    conv_handler = ConversationHandler(
+    # Hisse ekleme konuşması
+    ekle_conv = ConversationHandler(
         entry_points=[
             CommandHandler("ekle", ekle_start),
-            CallbackQueryHandler(cb_ekle,   pattern="^ekle$"),
-            CallbackQueryHandler(cb_nakit,  pattern="^nakit$"),
+            CallbackQueryHandler(cb_ekle, pattern="^ekle$"),
         ],
         states={
             ASK_TICKER:   [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_quantity)],
             ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_price)],
             ASK_PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, save_holding)],
-            ASK_CASH:     [MessageHandler(filters.TEXT & ~filters.COMMAND, save_cash)],
+        },
+        fallbacks=[CommandHandler("iptal", cancel)],
+    )
+
+    # Hisse satma konuşması
+    sat_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(cb_sat_menu, pattern="^sat_menu$"),
+        ],
+        states={
+            SAT_TICKER:   [CallbackQueryHandler(sat_ticker_secildi, pattern="^satx_")],
+            SAT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, sat_quantity)],
+            SAT_PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sat_price)],
+        },
+        fallbacks=[CommandHandler("iptal", cancel)],
+    )
+
+    # Nakit güncelleme konuşması
+    nakit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_nakit, pattern="^nakit$")],
+        states={
+            ASK_CASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_cash)],
+        },
+        fallbacks=[CommandHandler("iptal", cancel)],
+    )
+
+    # Başlangıç sermayesi konuşması
+    sermaye_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_sermaye, pattern="^sermaye$")],
+        states={
+            ASK_CAPITAL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, save_capital)],
+            ASK_CAPITAL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_capital_date)],
         },
         fallbacks=[CommandHandler("iptal", cancel)],
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu",  start))
-    app.add_handler(conv_handler)
+    app.add_handler(ekle_conv)
+    app.add_handler(sat_conv)
+    app.add_handler(nakit_conv)
+    app.add_handler(sermaye_conv)
 
     app.add_handler(CallbackQueryHandler(send_main_menu,  pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(cb_portfoy,      pattern="^portfoy$"))
+    app.add_handler(CallbackQueryHandler(cb_gecmis,       pattern="^gecmis$"))
     app.add_handler(CallbackQueryHandler(cb_liste,        pattern="^liste$"))
     app.add_handler(CallbackQueryHandler(cb_sil_menu,     pattern="^sil_menu$"))
     app.add_handler(CallbackQueryHandler(cb_sil_hisse,    pattern="^sil_[A-Z]+$"))
