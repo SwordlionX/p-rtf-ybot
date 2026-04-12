@@ -25,7 +25,7 @@ from database import (
     set_starting_capital,
     get_starting_info,
 )
-from prices import get_price, get_prices_bulk
+from prices import get_price, get_prices_bulk, is_fund
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -148,62 +148,98 @@ def _performance_block(grand_total: float, start_info: dict) -> str:
 
 
 def build_portfolio_text(holdings, prices, cash: float, realized_pnl: float = 0.0, start_info: dict = None) -> str:
-    lines = []
-    total_cost = 0
-    total_value = 0
+    stock_items = []   # (value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct)
+    fund_items  = []   # same tuple, for TEFAS funds
+    errors      = []   # error strings
+
+    stock_cost  = 0
+    stock_value = 0
+    fund_cost   = 0
+    fund_value  = 0
 
     for ticker, quantity, avg_cost in holdings:
         price = prices.get(ticker)
         if price is None:
-            lines.append((None, 0, f"⚠️ *{ticker}*: Fiyat alınamadı"))
+            errors.append(f"⚠️ *{ticker}*: Fiyat alınamadı")
             continue
-        cost = quantity * avg_cost
+        cost  = quantity * avg_cost
         value = quantity * price
-        pnl = value - cost
+        pnl   = value - cost
         pnl_pct = (pnl / cost) * 100 if cost > 0 else 0
         emoji = "🟢" if pnl >= 0 else "🔴"
-        total_cost += cost
-        total_value += value
-        lines.append((value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct))
+        row   = (value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct)
+        if is_fund(ticker):
+            fund_cost  += cost
+            fund_value += value
+            fund_items.append(row)
+        else:
+            stock_cost  += cost
+            stock_value += value
+            stock_items.append(row)
 
-    grand_total = total_value + cash
+    total_value  = stock_value + fund_value
+    grand_total  = total_value + cash
+    liquid_value = fund_value + cash   # fon + nakit = "likit"
 
-    formatted = []
-    for item in lines:
-        if item[0] is None:
-            formatted.append(item[2])
-            continue
-        value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct = item
-        alloc = (value / grand_total * 100) if grand_total > 0 else 0
-        formatted.append(
-            f"{emoji} *{ticker}* — %{alloc:.1f}\n"
+    # ── Hisseler bölümü ──────────────────────────────────────
+    stock_lines = []
+    for value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct in stock_items:
+        stock_lines.append(
+            f"{emoji} *{ticker}*\n"
             f"  {quantity:,.0f} adet | {avg_cost:.2f}₺ → {price:.2f}₺\n"
             f"  K/Z: {pnl:+,.2f}₺ ({pnl_pct:+.2f}%)"
         )
 
-    if cash > 0:
-        cash_alloc = (cash / grand_total * 100) if grand_total > 0 else 0
-        formatted.append(f"💵 *Nakit* — %{cash_alloc:.1f}\n  {cash:,.2f} ₺")
+    # ── Yatırım Fonu bölümü ───────────────────────────────────
+    fund_lines = []
+    for value, ticker, emoji, quantity, avg_cost, price, pnl, pnl_pct in fund_items:
+        fund_lines.append(
+            f"{emoji} *{ticker}* (fon)\n"
+            f"  {quantity:,.2f} pay | {avg_cost:.6f}₺ → {price:.6f}₺\n"
+            f"  Değer: {value:,.2f}₺  K/Z: {pnl:+,.2f}₺ ({pnl_pct:+.2f}%)"
+        )
 
-    total_pnl = total_value - total_cost
-    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-    total_emoji = "🟢" if total_pnl >= 0 else "🔴"
-    real_emoji = "🟢" if realized_pnl >= 0 else "🔴"
+    # ── Metni birleştir ───────────────────────────────────────
+    text = "📊 *BIST Portföy Durumu*\n" + "─" * 28 + "\n"
 
-    text = (
-        "📊 *BIST Portföy Durumu*\n"
-        + "─" * 28 + "\n"
-        + "\n\n".join(formatted)
-        + "\n\n" + "─" * 28 + "\n"
-        f"💼 *Hisse Yatırımı:* {total_cost:,.2f} ₺\n"
-        f"📈 *Hisse Değeri:* {total_value:,.2f} ₺\n"
+    if errors:
+        text += "\n".join(errors) + "\n\n"
+
+    if stock_lines:
+        text += "📈 *Hisseler*\n" + "\n\n".join(stock_lines)
+    else:
+        text += "_(Hisse yok)_"
+
+    if fund_lines or cash > 0:
+        text += "\n\n" + "─" * 28 + "\n"
+        text += "💵 *Yatırım Fonu / Nakit*\n"
+        if fund_lines:
+            text += "\n\n".join(fund_lines)
+        if cash > 0:
+            cash_alloc = (cash / grand_total * 100) if grand_total > 0 else 0
+            if fund_lines:
+                text += "\n\n"
+            text += f"💵 *Nakit:* {cash:,.2f} ₺"
+
+    # ── Özet ─────────────────────────────────────────────────
+    total_pnl     = (stock_value + fund_value) - (stock_cost + fund_cost)
+    total_cost_all = stock_cost + fund_cost
+    total_pnl_pct  = (total_pnl / total_cost_all * 100) if total_cost_all > 0 else 0
+    total_emoji    = "🟢" if total_pnl >= 0 else "🔴"
+    real_emoji     = "🟢" if realized_pnl >= 0 else "🔴"
+
+    liquid_alloc = (liquid_value / grand_total * 100) if grand_total > 0 else 0
+    stock_alloc  = (stock_value  / grand_total * 100) if grand_total > 0 else 0
+
+    text += "\n\n" + "─" * 28 + "\n"
+    text += (
+        f"📈 *Hisse Değeri:* {stock_value:,.2f} ₺ (%{stock_alloc:.1f})\n"
+        f"💵 *Fon + Nakit:* {liquid_value:,.2f} ₺ (%{liquid_alloc:.1f})\n"
+        f"🏦 *Toplam Portföy:* {grand_total:,.2f} ₺\n"
+        f"{total_emoji} *Anlık K/Z:* {total_pnl:+,.2f} ₺ ({total_pnl_pct:+.2f}%)"
     )
-    if cash > 0:
-        text += f"💵 *Nakit:* {cash:,.2f} ₺\n"
-    text += f"🏦 *Toplam Portföy:* {grand_total:,.2f} ₺\n"
-    text += f"{total_emoji} *Anlık K/Z:* {total_pnl:+,.2f} ₺ ({total_pnl_pct:+.2f}%)\n"
     if realized_pnl != 0:
-        text += f"{real_emoji} *Gerçekleşen K/Z:* {realized_pnl:+,.2f} ₺"
+        text += f"\n{real_emoji} *Gerçekleşen K/Z:* {realized_pnl:+,.2f} ₺"
 
     if start_info:
         text += _performance_block(grand_total, start_info)
